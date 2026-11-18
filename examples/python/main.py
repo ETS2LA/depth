@@ -1,12 +1,12 @@
-from ets2la_capture import FrameReader
+from ets2la_depth import DepthReader
 import cv2
 
-reader = FrameReader()
+reader = DepthReader()
 
 while True:
     frame = reader.get_frame()
     if frame is None:
         continue
 
-    cv2.imshow("ets2la_capture", frame.to_bgr())
+    cv2.imshow("ets2la_depth", frame.to_colormap())
     cv2.waitKey(1)

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(ets2la_capture VERSION 1.0.2 LANGUAGES CXX C)
+project(ets2la_depth VERSION 1.0.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,12 +12,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-add_library(ets2la_capture SHARED
+add_library(ets2la_depth SHARED
     src/dll/dllmain.cpp
-    src/dll/present_hook.cpp
+    src/dll/depth_hook.cpp
 )
 
-target_compile_definitions(ets2la_capture PRIVATE "ETS2LA_CAPTURE_VERSION=\"${PROJECT_VERSION}\"")
-target_include_directories(ets2la_capture PRIVATE include)
-target_link_libraries(ets2la_capture PRIVATE minhook d3d11 dxgi)
-set_target_properties(ets2la_capture PROPERTIES OUTPUT_NAME "ets2la_capture")
+target_compile_definitions(ets2la_depth PRIVATE "ETS2LA_DEPTH_VERSION=\"${PROJECT_VERSION}\"")
+target_include_directories(ets2la_depth PRIVATE include)
+target_link_libraries(ets2la_depth PRIVATE minhook d3d11 dxgi)
+set_target_properties(ets2la_depth PROPERTIES OUTPUT_NAME "ets2la_depth")

@@ -7,11 +7,11 @@ from typing import Optional
 
 import numpy as np
 
-CONTROL_MAGIC = 0x32435445
-DATA_MAGIC = 0x32445445
-CONTROL_NAME = "Local\\ETS2LA_Capture_Control"
-DATA_NAME_FMT = "Local\\ETS2LA_Capture_Data_{}"
-EVENT_NAMES = ("Local\\ETS2LA_Capture_Frame0", "Local\\ETS2LA_Capture_Frame1")
+CONTROL_MAGIC = 0x44435445
+DATA_MAGIC = 0x44445445
+CONTROL_NAME = "Local\\ETS2LA_Depth_Control"
+DATA_NAME_FMT = "Local\\ETS2LA_Depth_Data_{}"
+EVENT_NAMES = ("Local\\ETS2LA_Depth_Frame0", "Local\\ETS2LA_Depth_Frame1")
 
 CONTROL_BYTES = 4096
 SLOT_HEADER_BYTES = 256
@@ -28,7 +28,7 @@ CTL_MAX_READERS = 12
 CTL_QPC_FREQ = 16
 CTL_WRITER_PID = 24
 CTL_GENERATION = 64
-CTL_CAPTURING = 68
+CTL_PUBLISHING = 68
 CTL_LATEST = 72
 CTL_PUBLISHED = 80
 CTL_DROPPED = 88
@@ -47,13 +47,10 @@ FILE_MAP_WRITE = 0x0002
 FILE_MAP_READ = 0x0004
 
 _LAYOUTS = {
-    # dxgi_format: (name, bytes_per_pixel)
-    87: "BGRA8", 90: "BGRA8", 91: "BGRA8",
-    88: "BGRX8", 92: "BGRX8", 93: "BGRX8",
-    27: "RGBA8", 28: "RGBA8", 29: "RGBA8",
-    23: "RGB10A2", 24: "RGB10A2", 89: "RGB10A2",
-    9: "RGBA16F", 10: "RGBA16F", 11: "RGBA16F",
+    54: "Float16",  # DXGI_FORMAT_R16_FLOAT
 }
+
+SKY_VALUE = -65504.0
 
 
 def _load_kernel32():
@@ -118,8 +115,11 @@ class _DataMapping:
         self.layout = _LAYOUTS.get(self.format, "unknown")
 
 
-class Frame:
-    """One captured frame."""
+class DepthFrame:
+    """One depth frame: (H, W) float16 view-space z in meters, negative in front of the camera, -65504 is sky.
+
+    The size is the game's render resolution, which can differ from the window size.
+    """
 
     __slots__ = ("pixels", "width", "height", "format", "layout", "frame_index", "timestamp_qpc", "publish_qpc", "_check", "_reader")
 
@@ -131,44 +131,47 @@ class Frame:
         """Milliseconds since the game presented this frame."""
         return self._reader.ticks_to_ms(self._reader.qpc_now() - self.timestamp_qpc)
 
-    def to_bgr(self) -> np.ndarray:
-        """Contiguous (H, W, 3) uint8 BGR image (8-bit formats only)."""
-        return self._convert(rgb=False)
+    def to_meters(self, sky: float = float("inf")) -> np.ndarray:
+        """(H, W) float32 distance in meters in front of the camera. Sky pixels become `sky`."""
+        raw = self.pixels.astype(np.float32)
+        out = -raw
+        out[raw <= SKY_VALUE + 1.0] = sky
+        return out
 
-    def to_rgb(self) -> np.ndarray:
-        """Contiguous (H, W, 3) uint8 RGB image (8-bit formats only)."""
-        return self._convert(rgb=True)
+    def map_from_frame_pixel(self, frame_width: int, frame_height: int, x, y):
+        """Pixel (x, y) of another image of the same view (for example an ets2la_capture
+        frame of frame_width x frame_height) -> (depth_x, depth_y). x and y may be numpy arrays."""
+        dx = np.clip(((np.asarray(x) + 0.5) / frame_width * self.width).astype(np.int64), 0, self.width - 1)
+        dy = np.clip(((np.asarray(y) + 0.5) / frame_height * self.height).astype(np.int64), 0, self.height - 1)
+        return dx, dy
 
-    def _convert(self, rgb: bool) -> np.ndarray:
-        if self.layout not in ("BGRA8", "BGRX8", "RGBA8"):
-            raise NotImplementedError(f"cannot convert layout {self.layout} to 8-bit RGB/BGR")
-        src_is_bgr = self.layout in ("BGRA8", "BGRX8")
-        try:
-            import cv2
+    def meters_at(self, x: int, y: int) -> float:
+        """Distance in meters at a depth map pixel (inf for sky)."""
+        raw = float(self.pixels[y, x])
+        return float("inf") if raw <= SKY_VALUE + 1.0 else -raw
 
-            if src_is_bgr:
-                code = cv2.COLOR_BGRA2RGB if rgb else cv2.COLOR_BGRA2BGR
-            else:
-                code = cv2.COLOR_RGBA2RGB if rgb else cv2.COLOR_RGBA2BGR
-            return cv2.cvtColor(self.pixels, code)
-        except ImportError:
-            pass
-        if src_is_bgr == (not rgb):
-            return np.ascontiguousarray(self.pixels[:, :, :3])
-        return np.ascontiguousarray(self.pixels[:, :, 2::-1])
+    def to_colormap(self, near: float = 1.0, far: float = 200.0) -> np.ndarray:
+        """(H, W, 3) uint8 BGR preview, log scaled between near and far meters (sky = black). Needs OpenCV."""
+        import cv2
+
+        m = self.to_meters(sky=far)
+        t = (np.log(np.clip(m, near, far)) - np.log(near)) / (np.log(far) - np.log(near))
+        img = cv2.applyColorMap((255 - t * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        img[self.pixels <= SKY_VALUE + 1.0] = 0
+        return img
 
 
-class FrameReader:
+class DepthReader:
     """Lock-free reader.
 
     The constructor tries to connect once, and if that fails, `connected()` stays
     False and get_frame() / get_latest_frame() silently keep retrying the
-    connection in the background until the capture DLL shows up.
+    connection in the background until the depth DLL shows up.
     """
 
     def __init__(self):
         if kernel32 is None:
-            raise OSError("ets2la_capture only works on Windows")
+            raise OSError("ets2la_depth only works on Windows")
         self._qpc = ctypes.c_int64()
         self._ctl_handle = None
         self._ctl_addr = 0
@@ -187,7 +190,7 @@ class FrameReader:
     def connected(self) -> bool:
         return self._ctl_addr != 0
 
-    def get_frame(self, timeout_ms: int = 1000, copy: bool = True) -> Optional[Frame]:
+    def get_frame(self, timeout_ms: int = 1000, copy: bool = True) -> Optional[DepthFrame]:
         """Block until a frame newer than the last one returned exists.
 
         Returns None on timeout. copy=False returns a zero-copy view into
@@ -195,9 +198,59 @@ class FrameReader:
         """
         return self._acquire(True, timeout_ms, copy)
 
-    def get_latest_frame(self, copy: bool = True) -> Optional[Frame]:
+    def get_latest_frame(self, copy: bool = True) -> Optional[DepthFrame]:
         """Non-blocking: the newest frame right now (may repeat the last one)."""
         return self._acquire(False, 0, copy)
+
+    def get_frame_near(self, timestamp_qpc: int, tolerance_ms: float = 10.0, timeout_ms: int = 1000, copy: bool = True) -> Optional[DepthFrame]:
+        """Returns the depth frame that belongs to an ets2la_capture frame: the published
+        frame whose timestamp_qpc is closest to `timestamp_qpc` and at most tolerance_ms
+        away. Both plugins stamp the QPC time of the game's Present() call, so matching
+        frames differ by well under one frame time. Waits up to timeout_ms for the
+        frame to be published. Returns None if no frame within the tolerance exists.
+        """
+        if not self.connected():
+            now = time.perf_counter()
+            if now - self._last_reconnect >= 0.25:
+                self._last_reconnect = now
+                self._connect()
+            if not self.connected():
+                time.sleep(min(timeout_ms, 50) / 1000.0)
+                return None
+        self._heartbeat()
+        tol = int(tolerance_ms * self._freq / 1000.0)
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while True:
+            latest = self._c_latest.value
+            if latest:
+                m = self._ensure_mapping(self._c_gen.value)
+                best = None
+                newest_later = False
+                if m is not None:
+                    oldest = max(1, latest - (m.slot_count - 2))
+                    for index in range(latest, oldest - 1, -1):
+                        slot_off = m.slots_offset + (index % m.slot_count) * m.slot_stride
+                        s1, idx, ts, pub = struct.unpack_from(SLOT_FMT, m.buf, slot_off)
+                        if (s1 & 1) or idx != index:
+                            continue
+                        delta = abs(ts - timestamp_qpc)
+                        if best is None or delta < best[0]:
+                            best = (delta, (m, slot_off, s1, idx, ts, pub))
+                        if index == latest and ts > timestamp_qpc + tol:
+                            newest_later = True
+                if best is not None and best[0] <= tol:
+                    frame = self._make_frame(*best[1], copy)
+                    if frame is not None:
+                        self._last_index = max(self._last_index, frame.frame_index)
+                        return frame
+                    continue
+                if best is not None and newest_later:
+                    return None
+            if time.perf_counter() >= deadline:
+                return None
+            ev = self._events[(latest + 1) & 1]
+            kernel32.WaitForSingleObject(ev, 2)
+            self._heartbeat()
 
     def stats(self) -> dict:
         if not self.connected():
@@ -207,9 +260,9 @@ class FrameReader:
         return {
             "latest_frame": u64(CTL_LATEST),
             "frames_published": u64(CTL_PUBLISHED),
-            "frames_dropped_by_capture": u64(CTL_DROPPED),
+            "frames_dropped": u64(CTL_DROPPED),
             "generation": u32(CTL_GENERATION),
-            "capturing": bool(u32(CTL_CAPTURING)),
+            "publishing": bool(u32(CTL_PUBLISHING)),
             "writer_pid": u32(CTL_WRITER_PID),
         }
 
@@ -265,12 +318,12 @@ class FrameReader:
         if magic != CONTROL_MAGIC:
             kernel32.UnmapViewOfFile(addr)
             kernel32.CloseHandle(h)
-            return self._fail("capture DLL not ready")
+            return self._fail("depth DLL not ready")
         version = ctypes.c_uint32.from_address(addr + CTL_VERSION).value
         if version != PROTOCOL_VERSION:
             kernel32.UnmapViewOfFile(addr)
             kernel32.CloseHandle(h)
-            return self._fail("capture DLL protocol version mismatch")
+            return self._fail("depth DLL protocol version mismatch")
         events = [kernel32.OpenEventW(SYNCHRONIZE, False, n) for n in EVENT_NAMES]
         if not all(events):
             for e in events:
@@ -292,9 +345,9 @@ class FrameReader:
     _counter = 0
 
     def _register(self):
-        FrameReader._counter += 1
+        DepthReader._counter += 1
         pid = kernel32.GetCurrentProcessId()
-        self._my_id = (pid << 32) | (FrameReader._counter & 0xFFFFFFFF)
+        self._my_id = (pid << 32) | (DepthReader._counter & 0xFFFFFFFF)
         now = kernel32.GetTickCount64()
         start = pid % MAX_READERS
         chosen = start
@@ -370,12 +423,9 @@ class FrameReader:
     def _make_frame(self, m, slot_off, s1, idx, ts, pub, copy):
         off = slot_off + SLOT_HEADER_BYTES
         h, w = m.height, m.width
-        if m.layout == "RGB10A2":
-            pix = np.frombuffer(m.buf, np.uint32, h * w, off).reshape(h, w)
-        elif m.layout == "RGBA16F":
-            pix = np.frombuffer(m.buf, np.float16, h * w * 4, off).reshape(h, w, 4)
-        else:
-            pix = np.frombuffer(m.buf, np.uint8, h * w * m.bytes_per_pixel, off).reshape(h, w, m.bytes_per_pixel)
+        if m.layout != "Float16" or m.stride % 2 or m.stride < w * 2:
+            return None
+        pix = np.frombuffer(m.buf, np.float16, h * (m.stride // 2), off).reshape(h, m.stride // 2)[:, :w]
         seq_view = ctypes.c_uint64.from_address(m.addr + slot_off)
 
         def still_valid():
@@ -387,7 +437,7 @@ class FrameReader:
                 return None
         else:
             pix.flags.writeable = False
-        f = Frame()
+        f = DepthFrame()
         f.pixels = pix
         f.width, f.height, f.format, f.layout = w, h, m.format, m.layout
         f.frame_index, f.timestamp_qpc, f.publish_qpc = idx, ts, pub
@@ -395,7 +445,7 @@ class FrameReader:
         f._reader = self
         return f
 
-    def _acquire(self, only_new: bool, timeout_ms: int, copy: bool) -> Optional[Frame]:
+    def _acquire(self, only_new: bool, timeout_ms: int, copy: bool) -> Optional[DepthFrame]:
         if not self.connected():
             now = time.perf_counter()
             if now - self._last_reconnect >= 0.25:

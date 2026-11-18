@@ -5,13 +5,14 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "protocol.h"
 
-namespace ets2la_capture {
+namespace ets2la_depth {
 
 inline uint64_t qpc_now() {
     LARGE_INTEGER q;
@@ -19,7 +20,7 @@ inline uint64_t qpc_now() {
     return uint64_t(q.QuadPart);
 }
 
-struct FrameInfo {
+struct DepthInfo {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t stride = 0;
@@ -29,21 +30,53 @@ struct FrameInfo {
     uint64_t timestamp_qpc = 0;
     uint64_t publish_qpc = 0;
 
-    PixelLayout layout() const { return pixel_layout(format); }
+    DepthLayout layout() const { return depth_layout(format); }
     size_t size_bytes() const { return size_t(stride) * height; }
+
+    // Maps a pixel of another image of the same game view (for example an ets2la_capture
+    // frame of frame_width x frame_height) to the pixel of the depth map that covers
+    // its center. The depth map is rendered at the game's render resolution, which
+    // can differ from the window size.
+    void map_from_frame_pixel(uint32_t frame_width, uint32_t frame_height, uint32_t x, uint32_t y, uint32_t& depth_x, uint32_t& depth_y) const {
+        const double u = (double(x) + 0.5) / double(frame_width);
+        const double v = (double(y) + 0.5) / double(frame_height);
+        const double px = u * double(width);
+        const double py = v * double(height);
+        depth_x = px < 0.0 ? 0u : (px >= double(width) ? width - 1 : uint32_t(px));
+        depth_y = py < 0.0 ? 0u : (py >= double(height) ? height - 1 : uint32_t(py));
+    }
+
+protected:
+    // Raw value at a depth map pixel.
+    float raw_at(const uint8_t* base, uint32_t x, uint32_t y) const {
+        uint16_t half;
+        std::memcpy(&half, base + size_t(y) * stride + size_t(x) * 2, 2);
+        return half_to_float(half);
+    }
 };
 
 // Owning copy of a frame. Reuse one instance across calls to avoid allocations.
-struct Frame : FrameInfo {
+struct DepthFrame : DepthInfo {
     std::vector<uint8_t> data;
+
+    // Distance in meters in front of the camera. Infinity for sky.
+    float meters_at(uint32_t x, uint32_t y) const {
+        const float raw = raw_at(data.data(), x, y);
+        return raw <= kSkyValue + 1.0f ? std::numeric_limits<float>::infinity() : -raw;
+    }
 };
 
 // Non-owning view straight into shared memory. Keeps the mapping alive, but the
 // writer may overwrite the slot after kSlotCount-1 newer frames: call valid()
 // after you are done reading and discard the result if it returns false.
-class FrameView : public FrameInfo {
+class DepthView : public DepthInfo {
 public:
     const uint8_t* data = nullptr;
+
+    float meters_at(uint32_t x, uint32_t y) const {
+        const float raw = raw_at(data, x, y);
+        return raw <= kSkyValue + 1.0f ? std::numeric_limits<float>::infinity() : -raw;
+    }
     bool valid() const {
         if (!slot_) return false;
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -51,7 +84,7 @@ public:
     }
 
 private:
-    friend class FrameReader;
+    friend class DepthReader;
     std::shared_ptr<void> keepalive_;
     const SlotHeader* slot_ = nullptr;
     uint64_t seq_ = 0;
@@ -61,25 +94,25 @@ struct ReaderOptions {
     uint32_t spin_us = 0;
 };
 
-struct CaptureStats {
+struct DepthStats {
     uint64_t latest_frame = 0;
     uint64_t frames_published = 0;
-    uint64_t frames_dropped_by_capture = 0;
+    uint64_t frames_dropped = 0;
     uint32_t generation = 0;
-    bool capturing = false;
+    bool publishing = false;
     uint32_t writer_pid = 0;
 };
 
-class FrameReader {
+class DepthReader {
 public:
-    explicit FrameReader(ReaderOptions options = {}) : options_(options) {
+    explicit DepthReader(ReaderOptions options = {}) : options_(options) {
         connect();
     }
-    ~FrameReader() {
+    ~DepthReader() {
         disconnect();
     }
-    FrameReader(const FrameReader&) = delete;
-    FrameReader& operator=(const FrameReader&) = delete;
+    DepthReader(const DepthReader&) = delete;
+    DepthReader& operator=(const DepthReader&) = delete;
 
     bool connected() const {
         return ctl_ != nullptr;
@@ -90,12 +123,12 @@ public:
 
     // Blocks until a frame newer than the previous one returned by this reader
     // exists (or timeout) and copies it into `out`.
-    bool get_frame(Frame& out, uint32_t timeout_ms = 1000) {
+    bool get_frame(DepthFrame& out, uint32_t timeout_ms = 1000) {
         return acquire(&out, nullptr, true, timeout_ms);
     }
 
     // Non-blocking: newest frame available right now, copied into `out`.
-    bool get_latest_frame(Frame& out) {
+    bool get_latest_frame(DepthFrame& out) {
         return acquire(&out, nullptr, false, 0);
     }
 
@@ -103,35 +136,86 @@ public:
     // exists (or timeout) and returns a view into shared memory. The caller must
     // call valid() on the returned view after it is done reading to ensure that
     // the writer did not overwrite the slot in the meantime.
-    bool get_frame_view(FrameView& out, uint32_t timeout_ms = 1000) {
+    bool get_frame_view(DepthView& out, uint32_t timeout_ms = 1000) {
         return acquire(nullptr, &out, true, timeout_ms);
     }
 
     // Non-blocking: newest frame available right now, returns a view into shared
     // memory. The caller must call valid() on the returned view after it is done
     // reading to ensure that the writer did not overwrite the slot in the meantime.
-    bool get_latest_frame_view(FrameView& out) {
+    bool get_latest_frame_view(DepthView& out) {
         return acquire(nullptr, &out, false, 0);
+    }
+
+    // Returns the depth frame that belongs to an ets2la_capture frame: the published
+    // frame whose timestamp_qpc is closest to `timestamp_qpc` and at most tolerance_ms
+    // away. Both plugins stamp the QPC time of the game's Present() call, so matching
+    // frames differ by well under one frame time. Waits up to timeout_ms for the
+    // frame to be published. Returns false if no frame within the tolerance exists.
+    bool get_frame_near(DepthFrame& out, uint64_t timestamp_qpc, double tolerance_ms = 10.0, uint32_t timeout_ms = 1000) {
+        if (!ensure_connected(timeout_ms)) {
+            return false;
+        }
+        heartbeat();
+        const uint64_t toleranceTicks = uint64_t(tolerance_ms * double(freq_) / 1000.0);
+        const uint64_t deadline = qpc_now() + uint64_t(timeout_ms) * freq_ / 1000;
+        while (true) {
+            const uint64_t latest = ctl_->latest_frame.load(std::memory_order_acquire);
+            if (latest > 0) {
+                const uint64_t oldest = latest > kSlotCount - 2 ? latest - (kSlotCount - 2) : 1;
+                DepthView best;
+                uint64_t bestDelta = ~0ull;
+                bool newestIsLater = false;
+                for (uint64_t index = latest; index >= oldest && index > 0; --index) {
+                    DepthView candidate;
+                    if (!snapshot_index(index, candidate)) {
+                        continue;
+                    }
+                    const uint64_t ts = candidate.timestamp_qpc;
+                    const uint64_t delta = ts > timestamp_qpc ? ts - timestamp_qpc : timestamp_qpc - ts;
+                    if (delta < bestDelta) {
+                        bestDelta = delta;
+                        best = std::move(candidate);
+                    }
+                    if (index == latest && ts > timestamp_qpc + toleranceTicks) {
+                        newestIsLater = true;
+                    }
+                }
+                if (bestDelta <= toleranceTicks) {
+                    if (copy_view(best, out)) {
+                        if (out.frame_index > last_index_) last_index_ = out.frame_index;
+                        return true;
+                    }
+                    continue;
+                }
+                if (newestIsLater && bestDelta != ~0ull) {
+                    return false;
+                }
+            }
+            if (qpc_now() >= deadline || !wait_above(latest, deadline)) {
+                return false;
+            }
+        }
     }
 
     double ticks_to_ms(uint64_t ticks) const {
         return freq_ ? double(ticks) * 1000.0 / double(freq_) : 0.0;
     }
     // Time since the game presented this frame, in milliseconds.
-    double age_ms(const FrameInfo& f) const {
+    double age_ms(const DepthInfo& f) const {
         return ticks_to_ms(qpc_now() - f.timestamp_qpc);
     }
 
-    CaptureStats stats() const {
-        CaptureStats s;
+    DepthStats stats() const {
+        DepthStats s;
         if (!ctl_) {
             return s;
         }
         s.latest_frame = ctl_->latest_frame.load(std::memory_order_relaxed);
         s.frames_published = ctl_->frames_published.load(std::memory_order_relaxed);
-        s.frames_dropped_by_capture = ctl_->frames_dropped.load(std::memory_order_relaxed);
+        s.frames_dropped = ctl_->frames_dropped.load(std::memory_order_relaxed);
         s.generation = ctl_->generation.load(std::memory_order_relaxed);
-        s.capturing = ctl_->capturing.load(std::memory_order_relaxed) != 0;
+        s.publishing = ctl_->publishing.load(std::memory_order_relaxed) != 0;
         s.writer_pid = ctl_->writer_pid;
         return s;
     }
@@ -148,11 +232,11 @@ public:
         }
         if (ctl_->magic != kControlMagic) {
             disconnect();
-            return fail("capture DLL not ready");
+            return fail("depth DLL not ready");
         }
         if (ctl_->version != kProtocolVersion) {
             disconnect();
-            return fail("capture DLL protocol version mismatch");
+            return fail("depth DLL protocol version mismatch");
         }
         for (int i = 0; i < 2; ++i) {
             events_[i] = OpenEventW(SYNCHRONIZE, FALSE, kEventNames[i]);
@@ -265,7 +349,7 @@ private:
         return true;
     }
 
-    bool snapshot(uint64_t minExclusive, FrameView& out) {
+    bool snapshot(uint64_t minExclusive, DepthView& out) {
         for (int attempt = 0; attempt < 16; ++attempt) {
             const uint64_t latest = ctl_->latest_frame.load(std::memory_order_acquire);
             if (latest == 0 || latest <= minExclusive) {
@@ -276,49 +360,66 @@ private:
                 return false;
             }
 
-            const DataHeader* h = map_->hdr;
-            const uint8_t* base = static_cast<const uint8_t*>(map_->base);
-            const uint8_t* slotBase = base + h->slots_offset + (latest % h->slot_count) * h->slot_stride;
-            const SlotHeader* slot = reinterpret_cast<const SlotHeader*>(slotBase);
-
-            const uint64_t s1 = slot->seq.load(std::memory_order_acquire);
-            if ((s1 & 1) != 0 || slot->frame_index != latest) {
-                YieldProcessor();
-                continue;
+            if (read_slot(latest, out)) {
+                return true;
             }
-
-            out.width = h->width;
-            out.height = h->height;
-            out.stride = h->stride;
-            out.format = h->format;
-            out.bytes_per_pixel = h->bytes_per_pixel;
-            out.frame_index = latest;
-            out.timestamp_qpc = slot->timestamp_qpc;
-            out.publish_qpc = slot->publish_qpc;
-            out.data = slotBase + kSlotHeaderBytes;
-            out.slot_ = slot;
-            out.seq_ = s1;
-            out.keepalive_ = map_;
-
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (slot->seq.load(std::memory_order_relaxed) != s1) continue;
-            return true;
+            YieldProcessor();
         }
         return false;
     }
 
+    bool snapshot_index(uint64_t index, DepthView& out) {
+        const uint32_t gen = ctl_->generation.load(std::memory_order_acquire);
+        if (!ensure_mapping(gen)) {
+            return false;
+        }
+        return read_slot(index, out);
+    }
+
+    bool read_slot(uint64_t index, DepthView& out) {
+        const DataHeader* h = map_->hdr;
+        const uint8_t* base = static_cast<const uint8_t*>(map_->base);
+        const uint8_t* slotBase = base + h->slots_offset + (index % h->slot_count) * h->slot_stride;
+        const SlotHeader* slot = reinterpret_cast<const SlotHeader*>(slotBase);
+
+        const uint64_t s1 = slot->seq.load(std::memory_order_acquire);
+        if ((s1 & 1) != 0 || slot->frame_index != index) {
+            return false;
+        }
+
+        out.width = h->width;
+        out.height = h->height;
+        out.stride = h->stride;
+        out.format = h->format;
+        out.bytes_per_pixel = h->bytes_per_pixel;
+        out.frame_index = index;
+        out.timestamp_qpc = slot->timestamp_qpc;
+        out.publish_qpc = slot->publish_qpc;
+        out.data = slotBase + kSlotHeaderBytes;
+        out.slot_ = slot;
+        out.seq_ = s1;
+        out.keepalive_ = map_;
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return slot->seq.load(std::memory_order_relaxed) == s1;
+    }
+
     bool wait_for_newer(uint64_t deadline) {
+        return wait_above(last_index_, deadline);
+    }
+
+    bool wait_above(uint64_t index, uint64_t deadline) {
         if (options_.spin_us) {
             const uint64_t spinEnd = qpc_now() + uint64_t(options_.spin_us) * freq_ / 1000000ull;
             while (qpc_now() < spinEnd) {
-                if (ctl_->latest_frame.load(std::memory_order_acquire) > last_index_) {
+                if (ctl_->latest_frame.load(std::memory_order_acquire) > index) {
                     return true;
                 }
                 YieldProcessor();
             }
         }
         while (true) {
-            if (ctl_->latest_frame.load(std::memory_order_acquire) > last_index_) {
+            if (ctl_->latest_frame.load(std::memory_order_acquire) > index) {
                 return true;
             }
             const uint64_t now = qpc_now();
@@ -327,30 +428,38 @@ private:
             }
             const uint64_t remainingMs = ((deadline - now) * 1000 + freq_ - 1) / freq_;
             const DWORD slice = DWORD(remainingMs < 5 ? remainingMs : 5);
-            WaitForSingleObject(events_[(last_index_ + 1) & 1], slice ? slice : 1);
+            WaitForSingleObject(events_[(index + 1) & 1], slice ? slice : 1);
             heartbeat();
         }
     }
 
-    static bool copy_view(const FrameView& v, Frame& out) {
-        static_cast<FrameInfo&>(out) = v;
+    static bool copy_view(const DepthView& v, DepthFrame& out) {
+        static_cast<DepthInfo&>(out) = v;
         out.data.resize(v.size_bytes());
         std::memcpy(out.data.data(), v.data, v.size_bytes());
         return v.valid();
     }
 
-    bool acquire(Frame* copyOut, FrameView* viewOut, bool onlyNew, uint32_t timeoutMs) {
-        if (!ctl_) {
-            const DWORD now = GetTickCount();
-            if (now - lastReconnectTick_ < 250) {
-                Sleep(timeoutMs < 50 ? timeoutMs : 50);
-                return false;
-            }
-            lastReconnectTick_ = now;
-            if (!connect()) {
-                Sleep(timeoutMs < 50 ? timeoutMs : 50);
-                return false;
-            }
+    bool ensure_connected(uint32_t timeoutMs) {
+        if (ctl_) {
+            return true;
+        }
+        const DWORD now = GetTickCount();
+        if (now - lastReconnectTick_ < 250) {
+            Sleep(timeoutMs < 50 ? timeoutMs : 50);
+            return false;
+        }
+        lastReconnectTick_ = now;
+        if (!connect()) {
+            Sleep(timeoutMs < 50 ? timeoutMs : 50);
+            return false;
+        }
+        return true;
+    }
+
+    bool acquire(DepthFrame* copyOut, DepthView* viewOut, bool onlyNew, uint32_t timeoutMs) {
+        if (!ensure_connected(timeoutMs)) {
+            return false;
         }
         heartbeat();
         const uint64_t t0 = qpc_now();
@@ -359,7 +468,7 @@ private:
             if (onlyNew && !wait_for_newer(deadline)) {
                 return false;
             }
-            FrameView v;
+            DepthView v;
             if (snapshot(onlyNew ? last_index_ : 0, v)) {
                 if (viewOut) {
                     last_index_ = v.frame_index;

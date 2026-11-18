@@ -3,12 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cwchar>
 
-namespace ets2la_capture {
+namespace ets2la_depth {
 
-constexpr uint32_t kControlMagic = 0x32435445;  // "ETC2"
-constexpr uint32_t kDataMagic = 0x32445445;     // "ETD2"
+constexpr uint32_t kControlMagic = 0x44435445;  // "ETCD"
+constexpr uint32_t kDataMagic = 0x44445445;     // "ETDD"
 
 // Bump whenever ControlBlock/DataHeader layout or semantics change in any way.
 constexpr uint32_t kProtocolVersion = 1;
@@ -21,14 +22,14 @@ constexpr uint64_t kControlBytes = 4096;
 constexpr uint64_t kDataHeaderBytes = 4096;
 constexpr uint64_t kSlotHeaderBytes = 256;      // pixels start this far into a slot
 
-inline constexpr const wchar_t* kControlName = L"Local\\ETS2LA_Capture_Control";
+inline constexpr const wchar_t* kControlName = L"Local\\ETS2LA_Depth_Control";
 inline constexpr const wchar_t* kEventNames[2] = {
-    L"Local\\ETS2LA_Capture_Frame0",
-    L"Local\\ETS2LA_Capture_Frame1",
+    L"Local\\ETS2LA_Depth_Frame0",
+    L"Local\\ETS2LA_Depth_Frame1",
 };
 
 inline void make_data_name(wchar_t* out, size_t count, uint32_t generation) {
-    std::swprintf(out, count, L"Local\\ETS2LA_Capture_Data_%u", generation);
+    std::swprintf(out, count, L"Local\\ETS2LA_Depth_Data_%u", generation);
 }
 
 struct ReaderEntry {                        // 64 bytes, one cache line per reader
@@ -49,10 +50,10 @@ struct ControlBlock {
     uint8_t pad1[32];                       //  32
     // cache line 1..: updated per frame by the writer
     std::atomic<uint32_t> generation;       //  64  data mapping currently in use
-    std::atomic<uint32_t> capturing;        //  68  1 while the DLL is actively capturing
+    std::atomic<uint32_t> publishing;       //  68  1 while the DLL is actively publishing
     std::atomic<uint64_t> latest_frame;     //  72  index of newest complete frame, 0 = none
     std::atomic<uint64_t> frames_published; //  80
-    std::atomic<uint64_t> frames_dropped;   //  88  frames the capture side had to skip
+    std::atomic<uint64_t> frames_dropped;   //  88  frames the depth side had to skip
     std::atomic<uint64_t> last_publish_qpc; //  96
     uint8_t pad2[24];                       // 104
     ReaderEntry readers[kMaxReaders];       // 128
@@ -65,10 +66,10 @@ struct DataHeader {                         // lives in the first 4096 bytes
     uint32_t slot_count;                    // 12
     uint64_t slot_stride;                   // 16  bytes from one slot to the next
     uint64_t slots_offset;                  // 24  == kDataHeaderBytes
-    uint32_t width;                         // 32
+    uint32_t width;                         // 32  render resolution of the game
     uint32_t height;                        // 36
     uint32_t stride;                        // 40  bytes per row (tightly packed)
-    uint32_t format;                        // 44  DXGI_FORMAT value
+    uint32_t format;                        // 44  DXGI_FORMAT value (54 = R16_FLOAT)
     uint32_t bytes_per_pixel;               // 48
     uint32_t pad0;                          // 52
     uint64_t total_size;                    // 56
@@ -110,35 +111,42 @@ inline constexpr uint64_t slot_stride_for(uint64_t payload_bytes) {
     return align_up(kSlotHeaderBytes + payload_bytes, 4096);
 }
 
-enum class PixelLayout : uint32_t { Unknown = 0, BGRA8, BGRX8, RGBA8, RGB10A2, RGBA16F };
+enum class DepthLayout : uint32_t { Unknown = 0, Float16 };
 
-inline PixelLayout pixel_layout(uint32_t dxgi_format) {
-    switch (dxgi_format) {
-        case 87: case 90: case 91: return PixelLayout::BGRA8;    // B8G8R8A8 UNORM/TYPELESS/SRGB
-        case 88: case 92: case 93: return PixelLayout::BGRX8;    // B8G8R8X8 UNORM/TYPELESS/SRGB
-        case 27: case 28: case 29: return PixelLayout::RGBA8;    // R8G8B8A8 TYPELESS/UNORM/SRGB
-        case 23: case 24: case 89: return PixelLayout::RGB10A2;  // R10G10B10A2, XR_BIAS
-        case 9: case 10: case 11:  return PixelLayout::RGBA16F;  // R16G16B16A16 (float/typeless/unorm)
-        default: return PixelLayout::Unknown;
-    }
+constexpr float kSkyValue = -65504.0f;
+
+inline DepthLayout depth_layout(uint32_t dxgi_format) {
+    return dxgi_format == 54 ? DepthLayout::Float16 : DepthLayout::Unknown;  // DXGI_FORMAT_R16_FLOAT
 }
 inline uint32_t bytes_per_pixel_for(uint32_t dxgi_format) {
-    switch (pixel_layout(dxgi_format)) {
-        case PixelLayout::BGRA8: case PixelLayout::BGRX8:
-        case PixelLayout::RGBA8: case PixelLayout::RGB10A2: return 4;
-        case PixelLayout::RGBA16F: return 8;
-        default: return 0;
-    }
+    return depth_layout(dxgi_format) == DepthLayout::Float16 ? 2 : 0;
 }
-inline const char* pixel_layout_name(PixelLayout l) {
-    switch (l) {
-        case PixelLayout::BGRA8: return "BGRA8";
-        case PixelLayout::BGRX8: return "BGRX8";
-        case PixelLayout::RGBA8: return "RGBA8";
-        case PixelLayout::RGB10A2: return "RGB10A2";
-        case PixelLayout::RGBA16F: return "RGBA16F";
-        default: return "unknown";
+inline const char* depth_layout_name(DepthLayout l) {
+    return l == DepthLayout::Float16 ? "Float16" : "unknown";
+}
+
+inline float half_to_float(uint16_t h) {
+    const uint32_t sign = uint32_t(h >> 15) << 31;
+    const uint32_t exponent = (h >> 10) & 0x1Fu;
+    const uint32_t mantissa = h & 0x3FFu;
+    uint32_t bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            uint32_t e = 127 - 15 + 1;
+            uint32_t m = mantissa;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            bits = sign | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
     }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
 }
 
 }

@@ -1,10 +1,10 @@
 #include <windows.h>
-#include "present_hook.h"
+#include "depth_hook.h"
 #include "scs_logging.h"
-#include "../../include/ets2la_capture/protocol.h"
+#include "../../include/ets2la_depth/protocol.h"
 
-#ifndef ETS2LA_CAPTURE_VERSION
-#define ETS2LA_CAPTURE_VERSION "unknown"
+#ifndef ETS2LA_DEPTH_VERSION
+#define ETS2LA_DEPTH_VERSION "unknown"
 #endif
 
 namespace scs_logging {
@@ -23,7 +23,7 @@ void write(scs_log_type_t type, const char* message) {
     scs_log_t log = g_log.load(std::memory_order_acquire);
     if (log && message) {
         char prefixedMessage[512];
-        sprintf_s(prefixedMessage, sizeof(prefixedMessage), "[ets2la_capture] %s", message);
+        sprintf_s(prefixedMessage, sizeof(prefixedMessage), "[ets2la_depth] %s", message);
         log(type, prefixedMessage);
     }
 }
@@ -53,19 +53,19 @@ extern "C" __declspec(dllexport) scs_result_t SCSAPIFUNC scs_telemetry_init(
     const auto* versionedParams = static_cast<const scs_telemetry_init_params_v100_t*>(params);
     scs_logging::initialize(versionedParams->common.log);
     scs_logging::writef(
-        SCS_LOG_TYPE_message, "ets2la_capture v%s, NORMAL build (protocol %u)",
-        ETS2LA_CAPTURE_VERSION, unsigned(ets2la_capture::kProtocolVersion)
+        SCS_LOG_TYPE_message, "ets2la_depth v%s, NORMAL build (protocol %u)",
+        ETS2LA_DEPTH_VERSION, unsigned(ets2la_depth::kProtocolVersion)
     );
 
     CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-        StartPresentHook();
+        StartDepthHook();
         return 0;
     }, nullptr, 0, nullptr);
     return SCS_RESULT_ok;
 }
 
 extern "C" __declspec(dllexport) void scs_telemetry_shutdown() {
-    StopPresentHook();
+    StopDepthHook();
     scs_logging::shutdown();
 }
 
@@ -75,7 +75,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             DisableThreadLibraryCalls(hModule);
             break;
         case DLL_PROCESS_DETACH:
-            StopPresentHook(true);
+            StopDepthHook(true);
             scs_logging::shutdown();
             break;
     }

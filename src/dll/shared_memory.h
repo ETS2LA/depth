@@ -8,9 +8,9 @@
 #include <mutex>
 #include <string>
 
-#include "../../include/ets2la_capture/protocol.h"
+#include "../../include/ets2la_depth/protocol.h"
 
-namespace ets2la_capture {
+namespace ets2la_depth {
 
 class SecurityAttrs {
 public:
@@ -68,9 +68,9 @@ private:
     bool ok_ = false;
 };
 
-class SharedFrameWriter {
+class SharedDepthWriter {
 public:
-    ~SharedFrameWriter() {
+    ~SharedDepthWriter() {
         shutdown();
     }
 
@@ -112,7 +112,7 @@ public:
         ctl_->max_readers = kMaxReaders;
         ctl_->qpc_frequency = uint64_t(freq.QuadPart);
         ctl_->writer_pid = GetCurrentProcessId();
-        ctl_->capturing.store(0, std::memory_order_relaxed);
+        ctl_->publishing.store(0, std::memory_order_relaxed);
         ctl_->magic = kControlMagic;
 
         const uint64_t latest = ctl_->latest_frame.load(std::memory_order_relaxed);
@@ -188,9 +188,9 @@ public:
         return false;
     }
 
-    void set_capturing(bool on) {
+    void set_publishing(bool on) {
         if (ctl_) {
-            ctl_->capturing.store(on ? 1u : 0u, std::memory_order_relaxed);
+            ctl_->publishing.store(on ? 1u : 0u, std::memory_order_relaxed);
         }
     }
     void note_drop() {
@@ -202,7 +202,7 @@ public:
     void shutdown() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (ctl_) {
-            ctl_->capturing.store(0, std::memory_order_relaxed);
+            ctl_->publishing.store(0, std::memory_order_relaxed);
         }
         close_data();
         if (ctl_) {

@@ -1,26 +1,31 @@
-#include "ets2la_capture/frame_reader.h"
+#include "ets2la_depth/depth_reader.h"
 #include <opencv2/opencv.hpp>
 #include <cstdio>
 
-
 int main() {
-    ets2la_capture::FrameReader reader;
-    ets2la_capture::Frame frame;
+    ets2la_depth::DepthReader reader;
+    ets2la_depth::DepthFrame frame;
 
     while (true) {
         if (!reader.get_frame(frame)) {
             continue;
         }
 
-        cv::Mat native(int(frame.height), int(frame.width), CV_8UC4, frame.data.data(), frame.stride);
-        cv::Mat bgr;
-        if (frame.layout() == ets2la_capture::PixelLayout::RGBA8) {
-            cv::cvtColor(native, bgr, cv::COLOR_RGBA2BGR);
-        } else {
-            cv::cvtColor(native, bgr, cv::COLOR_BGRA2BGR);
-        }
+        cv::Mat rawHalf(int(frame.height), int(frame.width), CV_16F, frame.data.data(), frame.stride);
+        cv::Mat raw;
+        rawHalf.convertTo(raw, CV_32F);
+        cv::Mat skyMask = raw <= -65503.0;
+        cv::Mat negated = -raw;
+        cv::Mat meters = (cv::min)((cv::max)(negated, 1.0), 200.0);
+        cv::log(meters, meters);
+        meters /= std::log(200.0);
+        cv::Mat index;
+        meters.convertTo(index, CV_8U, -255.0, 255.0);
+        cv::Mat color;
+        cv::applyColorMap(index, color, cv::COLORMAP_TURBO);
+        color.setTo(cv::Scalar(0, 0, 0), skyMask);
 
-        cv::imshow("ets2la_capture", bgr);
+        cv::imshow("ets2la_depth", color);
         cv::waitKey(1);
     }
     return 0;

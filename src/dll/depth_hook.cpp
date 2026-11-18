@@ -7,6 +7,7 @@
 #include <MinHook.h>
 
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -14,7 +15,7 @@
 #include <mutex>
 #include <vector>
 
-#include "present_hook.h"
+#include "depth_hook.h"
 #include "scs_logging.h"
 #include "shared_memory.h"
 
@@ -22,21 +23,15 @@
 #pragma comment(lib, "dxgi.lib")
 
 using Microsoft::WRL::ComPtr;
-using namespace ets2la_capture;
+using namespace ets2la_depth;
 
-static_assert(
-    DXGI_FORMAT_B8G8R8A8_UNORM == 87 &&
-    DXGI_FORMAT_R8G8B8A8_UNORM == 28 &&
-    DXGI_FORMAT_R10G10B10A2_UNORM == 24 &&
-    DXGI_FORMAT_R16G16B16A16_FLOAT == 10,
-    "protocol.h format table must match DXGI_FORMAT"
-);
+static_assert(DXGI_FORMAT_R16_FLOAT == 54, "protocol.h format table must match DXGI_FORMAT");
 
 typedef HRESULT(WINAPI* Present_t)(IDXGISwapChain*, UINT, UINT);
 static Present_t oPresent = nullptr;
 static void* g_presentTarget = nullptr;
 
-static SharedFrameWriter g_writer;
+static SharedDepthWriter g_writer;
 static std::atomic<bool> g_writerReady{false};
 static std::atomic<bool> g_hookInstalled{false};
 static std::atomic<bool> g_stopping{false};
@@ -47,6 +42,20 @@ static uint64_t Qpc() {
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     return uint64_t(q.QuadPart);
+}
+
+static bool DepthSamplesAllZero(const uint8_t* data, uint32_t pitch, uint32_t width, uint32_t height) {
+    for (uint32_t gy = 0; gy < 16; ++gy) {
+        for (uint32_t gx = 0; gx < 16; ++gx) {
+            const uint32_t x = (gx * 2 + 1) * width / 32, y = (gy * 2 + 1) * height / 32;
+            uint16_t half;
+            std::memcpy(&half, data + size_t(y) * pitch + size_t(x) * 2, 2);
+            if ((half & 0x7FFF) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static void LogOnce(std::atomic<bool>& flag, scs_log_type_t type, const char* msg) {
@@ -80,8 +89,27 @@ struct PipelineC {
 struct Job {
     std::shared_ptr<PipelineC> p;
     int idx = 0;
-    uint64_t qpc = 0;
+    std::shared_ptr<std::atomic<uint64_t>> qpc;
 };
+
+static std::mutex g_qpcMutex;
+static std::condition_variable g_qpcCv;
+
+static void SetPresentQpc(std::atomic<uint64_t>& token, uint64_t qpc) {
+    token.store(qpc, std::memory_order_release);
+    { std::lock_guard<std::mutex> lk(g_qpcMutex); }
+    g_qpcCv.notify_all();
+}
+
+static uint64_t WaitForPresentQpc(const std::atomic<uint64_t>& token) {
+    uint64_t qpc = token.load(std::memory_order_acquire);
+    if (qpc != 0) return qpc;
+    std::unique_lock<std::mutex> lk(g_qpcMutex);
+    g_qpcCv.wait_for(lk, std::chrono::milliseconds(200), [&] {
+        return token.load(std::memory_order_acquire) != 0 || g_stopping.load();
+    });
+    return token.load(std::memory_order_acquire);
+}
 
 static std::shared_ptr<PipelineC> g_pipeC;
 static std::vector<std::shared_ptr<PipelineC>> g_retired;
@@ -237,10 +265,28 @@ static void ProcessJob(const Job& job) {
         WorkerFail("Map");
         return;
     }
-    if (g_writer.ensure_geometry(p.width, p.height, uint32_t(p.format), p.bpp)) {
-        g_writer.publish(static_cast<const uint8_t*>(m.pData), m.RowPitch, job.qpc);
+    static int emptyFrames = 0;
+    const uint8_t* pixels = static_cast<const uint8_t*>(m.pData);
+    bool failed = false;
+    if (DepthSamplesAllZero(pixels, m.RowPitch, p.width, p.height)) {
+        if (++emptyFrames == 5) {
+            failed = true;
+        }
+    } else {
+        emptyFrames = 0;
+        if (g_writer.ensure_geometry(p.width, p.height, uint32_t(p.format), p.bpp)) {
+            const uint64_t qpc = WaitForPresentQpc(*job.qpc);
+            if (qpc != 0) {
+                g_writer.publish(pixels, m.RowPitch, qpc);
+            } else {
+                g_writer.note_drop();
+            }
+        }
     }
     g_wctx->Unmap(p.staging.Get(), 0);
+    if (failed) {
+        WorkerFail("shared texture returned only zeros");
+    }
 }
 
 static DWORD WINAPI WorkerMain(LPVOID) {
@@ -272,13 +318,15 @@ static DWORD WINAPI WorkerMain(LPVOID) {
 static void CaptureShared(
     ID3D11Device* dev,
     ID3D11DeviceContext* ctx,
-    ID3D11Texture2D* bb,
+    ID3D11Texture2D* src,
     const D3D11_TEXTURE2D_DESC& d,
     uint32_t bpp,
-    uint64_t presentQpc,
-    bool& handled
+    const std::shared_ptr<std::atomic<uint64_t>>& qpcToken,
+    bool& handled,
+    bool& submitted
 ) {
     handled = true;
+    submitted = false;
     if (!g_pipeC || g_pipeC->gameDevice.Get() != dev || g_pipeC->width != d.Width ||
         g_pipeC->height != d.Height || g_pipeC->format != d.Format) {
         if (g_pipeC) g_retired.push_back(std::move(g_pipeC));
@@ -296,14 +344,15 @@ static void CaptureShared(
         const int idx = (p.next + k) % kRing;
         SharedTex& t = p.tex[idx];
         if (t.gameKm->AcquireSync(0, 0) != S_OK) continue;
-        ctx->CopyResource(t.gameTex.Get(), bb);
+        ctx->CopyResource(t.gameTex.Get(), src);
         t.gameKm->ReleaseSync(1);
         p.next = (idx + 1) % kRing;
         {
             std::lock_guard<std::mutex> lk(g_jobMutex);
-            g_jobs.push_back(Job{g_pipeC, idx, presentQpc});
+            g_jobs.push_back(Job{g_pipeC, idx, qpcToken});
         }
         g_jobCv.notify_one();
+        submitted = true;
         return;
     }
     g_writer.note_drop();
@@ -326,7 +375,7 @@ static std::unique_ptr<PipelineB> g_pipeB;
 static void CaptureStaging(
     ID3D11Device* dev,
     ID3D11DeviceContext* ctx,
-    ID3D11Texture2D* bb,
+    ID3D11Texture2D* src,
     const D3D11_TEXTURE2D_DESC& d,
     uint32_t bpp,
     uint64_t presentQpc
@@ -370,10 +419,201 @@ static void CaptureStaging(
         if (hr != DXGI_ERROR_WAS_STILL_DRAWING) break;
     }
 
-    ctx->CopyResource(p.staging[p.writeIdx].Get(), bb);
+    ctx->CopyResource(p.staging[p.writeIdx].Get(), src);
     p.valid[p.writeIdx] = true;
     p.qpc[p.writeIdx] = presentQpc;
     p.writeIdx = (p.writeIdx + 1) % kStageCount;
+}
+
+constexpr int kMaxSetsAfterGbuffer = 64;
+constexpr UINT kMinGbufferSize = 256;
+
+struct Detection {
+    std::atomic<bool> active{false};
+    std::atomic<bool> awaitingDepth{false};
+    std::mutex mutex;
+    uint32_t gbufferWidth = 0;
+    uint32_t gbufferHeight = 0;
+    int setsSinceGbuffer = 0;
+    ComPtr<ID3D11Texture2D> depthTexture;
+    std::atomic<bool> snapshotPending{false};
+    bool snapshotTaken = false;
+    std::shared_ptr<std::atomic<uint64_t>> pendingQpc;
+    ComPtr<ID3D11Texture2D> snapshot;
+    D3D11_TEXTURE2D_DESC snapshotDesc = {};
+
+    void reset_locked() {
+        snapshotPending.store(false, std::memory_order_relaxed);
+        snapshotTaken = false;
+        pendingQpc.reset();
+        gbufferWidth = gbufferHeight = 0;
+        setsSinceGbuffer = 0;
+        depthTexture.Reset();
+        awaitingDepth.store(false, std::memory_order_relaxed);
+    }
+};
+static Detection g_det;
+
+constexpr size_t kVtableOMSetRenderTargets = 33;
+constexpr size_t kVtableOMSetRenderTargetsAndUnorderedAccessViews = 34;
+
+typedef void(STDMETHODCALLTYPE* OMSetRenderTargets_t) (
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*
+);
+typedef void(STDMETHODCALLTYPE* OMSetRenderTargetsAndUAVs_t) (
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*,
+    UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*
+);
+static OMSetRenderTargets_t oOMSetRenderTargets = nullptr;
+static OMSetRenderTargetsAndUAVs_t oOMSetRenderTargetsAndUAVs = nullptr;
+static bool g_contextHooksInstalled = false;
+
+static bool GetTargetTexture(ID3D11RenderTargetView* view, D3D11_TEXTURE2D_DESC& desc, ComPtr<ID3D11Texture2D>& texture) {
+    ComPtr<ID3D11Resource> resource;
+    view->GetResource(&resource);
+    if (!resource || FAILED(resource.As(&texture))) {
+        return false;
+    }
+    texture->GetDesc(&desc);
+    return true;
+}
+
+static void TakeSnapshot(ID3D11DeviceContext* ctx) {
+    std::lock_guard<std::mutex> lk(g_det.mutex);
+    g_det.snapshotPending.store(false, std::memory_order_relaxed);
+    if (!g_det.depthTexture) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    g_det.depthTexture->GetDesc(&desc);
+    if (desc.ArraySize != 1) {
+        return;
+    }
+    if (!g_det.snapshot || g_det.snapshotDesc.Width != desc.Width || g_det.snapshotDesc.Height != desc.Height ||
+        g_det.snapshotDesc.Format != desc.Format) {
+        ComPtr<ID3D11Device> device;
+        g_det.depthTexture->GetDevice(&device);
+        D3D11_TEXTURE2D_DESC snapshotDesc = desc;
+        snapshotDesc.MipLevels = 1;
+        snapshotDesc.ArraySize = 1;
+        snapshotDesc.Usage = D3D11_USAGE_DEFAULT;
+        snapshotDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        snapshotDesc.CPUAccessFlags = 0;
+        snapshotDesc.MiscFlags = 0;
+        g_det.snapshot.Reset();
+        if (FAILED(device->CreateTexture2D(&snapshotDesc, nullptr, &g_det.snapshot))) {
+            return;
+        }
+        g_det.snapshotDesc = snapshotDesc;
+        scs_logging::writef(SCS_LOG_TYPE_message, "depth map found: %ux%u (R16_FLOAT)", desc.Width, desc.Height);
+    }
+    ctx->CopySubresourceRegion(g_det.snapshot.Get(), 0, 0, 0, 0, g_det.depthTexture.Get(), 0, nullptr);
+    g_det.snapshotTaken = true;
+    if (g_useShared.load()) {
+        ComPtr<ID3D11Device> device;
+        g_det.depthTexture->GetDevice(&device);
+        auto token = std::make_shared<std::atomic<uint64_t>>(0);
+        bool handled = true, submitted = false;
+        CaptureShared(device.Get(), ctx, g_det.snapshot.Get(), g_det.snapshotDesc, bytes_per_pixel_for(uint32_t(g_det.snapshotDesc.Format)), token, handled, submitted);
+        if (submitted) {
+            g_det.pendingQpc = token;
+        }
+    }
+}
+
+static void AnalyzeRenderTargets(ID3D11DeviceContext* ctx, UINT count, ID3D11RenderTargetView* const* views) {
+    if (g_det.snapshotPending.load(std::memory_order_relaxed) && ctx->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+        TakeSnapshot(ctx);
+    }
+    if (!views || count == 0 || !views[0] || count == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+        return;
+    }
+    const bool maybeGbuffer = count >= 4;
+    const bool maybeDepth = count == 1 && g_det.awaitingDepth.load(std::memory_order_relaxed);
+    if (!maybeGbuffer && !maybeDepth) {
+        return;
+    }
+    if (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC desc;
+    ComPtr<ID3D11Texture2D> texture;
+    if (!GetTargetTexture(views[0], desc, texture) || desc.SampleDesc.Count != 1) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(g_det.mutex);
+    if (maybeGbuffer) {
+        if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Width < kMinGbufferSize || desc.Height < kMinGbufferSize) {
+            return;
+        }
+        const uint64_t area = uint64_t(desc.Width) * desc.Height;
+        const uint64_t bestArea = uint64_t(g_det.gbufferWidth) * g_det.gbufferHeight;
+        if (area < bestArea) {
+            return;
+        }
+        if (area > bestArea) {
+            g_det.depthTexture.Reset();
+        }
+        g_det.gbufferWidth = desc.Width;
+        g_det.gbufferHeight = desc.Height;
+        g_det.setsSinceGbuffer = 0;
+        g_det.awaitingDepth.store(!g_det.depthTexture, std::memory_order_relaxed);
+        return;
+    }
+
+    if (++g_det.setsSinceGbuffer > kMaxSetsAfterGbuffer) {
+        g_det.awaitingDepth.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (desc.Format == DXGI_FORMAT_R16_FLOAT && desc.Width == g_det.gbufferWidth && desc.Height == g_det.gbufferHeight) {
+        g_det.depthTexture = texture;
+        g_det.awaitingDepth.store(false, std::memory_order_relaxed);
+        g_det.snapshotPending.store(true, std::memory_order_relaxed);
+    }
+}
+
+static void STDMETHODCALLTYPE hkOMSetRenderTargets(
+    ID3D11DeviceContext* ctx, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depthView
+) {
+    oOMSetRenderTargets(ctx, count, views, depthView);
+    if (g_det.active.load(std::memory_order_relaxed)) {
+        try {
+            AnalyzeRenderTargets(ctx, count, views);
+        } catch (...) {
+        }
+    }
+}
+
+static void STDMETHODCALLTYPE hkOMSetRenderTargetsAndUAVs(
+    ID3D11DeviceContext* ctx, UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depthView,
+    UINT uavStart, UINT uavCount, ID3D11UnorderedAccessView* const* uavs, const UINT* uavInitialCounts
+) {
+    oOMSetRenderTargetsAndUAVs(ctx, count, views, depthView, uavStart, uavCount, uavs, uavInitialCounts);
+    if (g_det.active.load(std::memory_order_relaxed)) {
+        try {
+            AnalyzeRenderTargets(ctx, count, views);
+        } catch (...) {
+        }
+    }
+}
+
+static void InstallContextHooks(ID3D11DeviceContext* ctx) {
+    g_contextHooksInstalled = true;
+    void** vtable = *reinterpret_cast<void***>(ctx);
+    bool ok = true;
+    ok &= MH_CreateHook(vtable[kVtableOMSetRenderTargets], reinterpret_cast<void*>(&hkOMSetRenderTargets),
+                        reinterpret_cast<void**>(&oOMSetRenderTargets)) == MH_OK;
+    ok &= MH_CreateHook(vtable[kVtableOMSetRenderTargetsAndUnorderedAccessViews], reinterpret_cast<void*>(&hkOMSetRenderTargetsAndUAVs),
+                        reinterpret_cast<void**>(&oOMSetRenderTargetsAndUAVs)) == MH_OK;
+    ok &= MH_EnableHook(vtable[kVtableOMSetRenderTargets]) == MH_OK;
+    ok &= MH_EnableHook(vtable[kVtableOMSetRenderTargetsAndUnorderedAccessViews]) == MH_OK;
+    if (ok) {
+        scs_logging::write(SCS_LOG_TYPE_message, "render target hooks installed");
+    } else {
+        scs_logging::write(SCS_LOG_TYPE_error, "render target hooks failed, no depth will be published");
+    }
 }
 
 static IDXGISwapChain* g_primarySC = nullptr;
@@ -420,45 +660,71 @@ static void CaptureFrame(IDXGISwapChain* sc) {
 
     if (!IsCaptureTarget(sc, nowMs)) return;
 
-    const bool active = g_writer.has_active_readers();
-    g_writer.set_capturing(active);
-    if (!active) return;
-
     ComPtr<ID3D11Device> dev;
     if (FAILED(sc->GetDevice(IID_PPV_ARGS(&dev)))) return;
-    ComPtr<ID3D11Texture2D> bb;
-    if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&bb)))) return;
-    D3D11_TEXTURE2D_DESC d;
-    bb->GetDesc(&d);
-
-    static std::atomic<bool> warnedFormat{false}, warnedMsaa{false}, warnedSize{false};
-    const uint32_t bpp = bytes_per_pixel_for(uint32_t(d.Format));
-    if (bpp == 0) {
-        LogOnce(warnedFormat, SCS_LOG_TYPE_warning, "back buffer format not supported by ets2la_capture");
-        return;
-    }
-    if (d.SampleDesc.Count > 1) {
-        LogOnce(warnedMsaa, SCS_LOG_TYPE_warning, "multisampled back buffer not supported");
-        return;
-    }
-    if (d.Width > 16384 || d.Height > 16384) {
-        LogOnce(warnedSize, SCS_LOG_TYPE_warning, "back buffer too large");
-        return;
-    }
-
     ComPtr<ID3D11DeviceContext> ctx;
     dev->GetImmediateContext(&ctx);
 
+    if (!g_contextHooksInstalled) {
+        InstallContextHooks(ctx.Get());
+    }
+
+    ComPtr<ID3D11Texture2D> src;
+    std::shared_ptr<std::atomic<uint64_t>> earlyToken;
+    {
+        std::lock_guard<std::mutex> lk(g_det.mutex);
+        if (g_det.snapshotTaken) {
+            src = g_det.snapshot;
+        }
+        earlyToken = std::move(g_det.pendingQpc);
+        g_det.depthTexture.Reset();
+        g_det.reset_locked();
+    }
+    if (earlyToken) {
+        SetPresentQpc(*earlyToken, presentQpc);
+    }
+    const bool active = g_writer.has_active_readers();
+    g_writer.set_publishing(active);
+    g_det.active.store(active, std::memory_order_relaxed);
+    if (!active) return;
+
+    static std::atomic<bool> warnedMissing{false}, warnedDevice{false}, warnedSize{false};
+    static std::atomic<int> missingFrames{0};
+    if (!src) {
+        if (missingFrames.fetch_add(1) == 600) {
+            LogOnce(warnedMissing, SCS_LOG_TYPE_warning, "no depth texture found for 600 frames");
+        }
+        return;
+    }
+    missingFrames.store(0);
+    if (earlyToken) return;
+
+    ComPtr<ID3D11Device> srcDev;
+    src->GetDevice(&srcDev);
+    if (srcDev.Get() != dev.Get()) {
+        LogOnce(warnedDevice, SCS_LOG_TYPE_warning, "depth texture belongs to another device");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC d;
+    src->GetDesc(&d);
+    const uint32_t bpp = bytes_per_pixel_for(uint32_t(d.Format));
+    if (bpp == 0 || d.SampleDesc.Count > 1) return;
+    if (d.Width > 16384 || d.Height > 16384) {
+        LogOnce(warnedSize, SCS_LOG_TYPE_warning, "depth texture too large");
+        return;
+    }
+
     if (g_useShared.load()) {
-        bool handled = true;
-        CaptureShared(dev.Get(), ctx.Get(), bb.Get(), d, bpp, presentQpc, handled);
+        bool handled = true, submitted = false;
+        auto token = std::make_shared<std::atomic<uint64_t>>(presentQpc);
+        CaptureShared(dev.Get(), ctx.Get(), src.Get(), d, bpp, token, handled, submitted);
         if (handled) return;
     }
     if (g_pipeC) {
         g_retired.push_back(std::move(g_pipeC));
         g_pipeC = nullptr;
     }
-    CaptureStaging(dev.Get(), ctx.Get(), bb.Get(), d, bpp, presentQpc);
+    CaptureStaging(dev.Get(), ctx.Get(), src.Get(), d, bpp, presentQpc);
 }
 
 static HRESULT WINAPI hkPresent(IDXGISwapChain* sc, UINT syncInterval, UINT flags) {
@@ -477,7 +743,7 @@ static void* GetPresentAddressViaDummyDevice() {
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"ets2la_capture_dummy";
+    wc.lpszClassName = L"ets2la_depth_dummy";
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"dummy", WS_OVERLAPPEDWINDOW,
@@ -540,7 +806,7 @@ static void StopWorker(bool join) {
     }
 }
 
-bool StartPresentHook() {
+bool StartDepthHook() {
     if (g_hookInstalled.exchange(true)) {
         return true;
     }
@@ -564,7 +830,10 @@ bool StartPresentHook() {
     }
 
     g_workerThread = CreateThread(nullptr, 0, WorkerMain, nullptr, 0, nullptr);
-    if (!g_workerThread) return giveUp("could not start capture worker thread");
+    if (!g_workerThread) return giveUp("could not start depth worker thread");
+
+    // prevent a race condition with ets2la_capture
+    Sleep(1000);
 
     g_presentTarget = GetPresentAddressViaDummyDevice();
     if (!g_presentTarget) return giveUp("could not obtain Present address, giving up");
@@ -578,9 +847,10 @@ bool StartPresentHook() {
     return true;
 }
 
-void StopPresentHook(bool process_detach) {
+void StopDepthHook(bool process_detach) {
     if (!g_hookInstalled.exchange(false)) return;
     g_stopping.store(true);
+    g_det.active.store(false);
     MH_DisableHook(MH_ALL_HOOKS);
 
     if (process_detach) return;
@@ -589,6 +859,11 @@ void StopPresentHook(bool process_detach) {
         Sleep(1);
     }
     MH_Uninitialize();
+    g_contextHooksInstalled = false;
+    {
+        std::lock_guard<std::mutex> lk(g_det.mutex);
+        g_det.reset_locked();
+    }
     StopWorker(true);
     g_pipeC.reset();
     g_retired.clear();

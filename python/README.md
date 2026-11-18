@@ -1,6 +1,6 @@
-# ets2la_capture
+# ets2la_depth
 
-Lock-free reader for the `ets2la_capture.dll` shared-memory.
+Lock-free reader for the `ets2la_depth.dll` shared-memory.
 
 ## Installation
 
@@ -11,12 +11,12 @@ pip install ./python
 ## Usage
 
 ```python
-from ets2la_capture import FrameReader
+from ets2la_depth import DepthReader
 
-reader = FrameReader()
-frame = reader.get_frame(timeout_ms=1000)     # next new frame, or None
-img = frame.pixels                            # (H, W, 4) uint8 in native order (frame.layout)
-bgr = frame.to_bgr()                          # contiguous BGR for OpenCV
+reader = DepthReader()
+frame = reader.get_frame(timeout_ms=1000)  # frame.pixels: (H, W) float16, negative meters, sky = -65504
+meters = frame.to_meters()  # float32 positive, sky = inf
+near = reader.get_frame_near(capture_frame.timestamp_qpc)  # match an ets2la_capture frame
 ```
 
 * `get_frame(copy=False)` returns a zero-copy view into shared memory. Check `frame.is_valid()` after use, if it is `False` the writer lapped you, discard.
