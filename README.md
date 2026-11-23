@@ -1,6 +1,6 @@
 # ets2la_depth
 
-In-process frame depth capture for Euro Truck Simulator 2 / American Truck Simulator that shares the game's depth map through shared memory.
+ets2la_depth is a DLL plugin for Euro Truck Simulator 2 and American Truck Simulator that shares the game's linear depth map with clients through shared memory, with timestamps that pair each depth frame to its capture frame.
 
 ## Build
 
